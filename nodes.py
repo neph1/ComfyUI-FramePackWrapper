@@ -375,6 +375,8 @@ class FramePackSampler:
                     }),
             },
             "optional": {
+                "positive_start": ("CONDITIONING",),
+                "positive_end": ("CONDITIONING",),
                 "start_latent": ("LATENT", {"tooltip": "init Latents to use for image2video"} ),
                 "end_latent": ("LATENT", {"tooltip": "end Latents to use for image2video"} ),
                 "end_image_embeds": ("CLIP_VISION_OUTPUT", {"tooltip": "end Image's clip embeds"} ),
@@ -391,7 +393,7 @@ class FramePackSampler:
     CATEGORY = "FramePackWrapper"
 
     def process(self, model, shift, positive, negative, latent_window_size, use_teacache, total_second_length, teacache_rel_l1_thresh, image_embeds, steps, cfg,
-                guidance_scale, seed, sampler, gpu_memory_preservation, start_latent=None, end_latent=None, end_image_embeds=None, embed_interpolation="linear", start_embed_strength=1.0, initial_samples=None, denoise_strength=1.0):
+                guidance_scale, seed, sampler, gpu_memory_preservation, positive_start=None, positive_end=None, start_latent=None, end_latent=None, end_image_embeds=None, embed_interpolation="linear", start_embed_strength=1.0, initial_samples=None, denoise_strength=1.0):
         total_latent_sections = (total_second_length * 30) / (latent_window_size * 4)
         total_latent_sections = int(max(round(total_latent_sections), 1))
         print("total_latent_sections: ", total_latent_sections)
@@ -423,17 +425,28 @@ class FramePackSampler:
         else:
             end_image_encoder_last_hidden_state = torch.zeros_like(start_image_encoder_last_hidden_state)
 
-        llama_vec = positive[0][0].to(base_dtype).to(device)
-        clip_l_pooler = positive[0][1]["pooled_output"].to(base_dtype).to(device)
+        llama_vecs = [positive[0][0].to(base_dtype).to(device)]
+        clip_l_poolers = [positive[0][1]["pooled_output"].to(base_dtype).to(device)]
+        if positive_start is not None:
+            llama_vecs.insert(0, positive_start[0][0].to(base_dtype).to(device))
+            clip_l_poolers.insert(0, positive_start[0][1]["pooled_output"].to(base_dtype).to(device))
+        if positive_end is not None:
+            llama_vecs.append(positive_end[0][0].to(base_dtype).to(device))
+            clip_l_poolers.append(positive_end[0][1]["pooled_output"].to(base_dtype).to(device))
 
+        
         if not math.isclose(cfg, 1.0):
             llama_vec_n = negative[0][0].to(base_dtype)
             clip_l_pooler_n = negative[0][1]["pooled_output"].to(base_dtype).to(device)
         else:
-            llama_vec_n = torch.zeros_like(llama_vec, device=device)
-            clip_l_pooler_n = torch.zeros_like(clip_l_pooler, device=device)
-
-        llama_vec, llama_attention_mask = crop_or_pad_yield_mask(llama_vec, length=512)
+            llama_vec_n = torch.zeros_like(llama_vecs[0], device=device)
+            clip_l_pooler_n = torch.zeros_like(clip_l_poolers[0], device=device)
+        llama_vecs_cropped = []
+        llama_attention_masks = []
+        for llama_vec in llama_vecs:
+            llama_vec, llama_attention_mask = crop_or_pad_yield_mask(llama_vec, length=512)
+            llama_vecs_cropped.append(llama_vec)
+            llama_attention_masks.append(llama_attention_mask)
         llama_vec_n, llama_attention_mask_n = crop_or_pad_yield_mask(llama_vec_n, length=512)
             
 
@@ -469,6 +482,10 @@ class FramePackSampler:
             # use `latent_paddings = list(reversed(range(total_latent_sections)))` to compare
             latent_paddings = [3] + [2] * (total_latent_sections - 3) + [1, 0]
             latent_paddings_list = latent_paddings.copy()
+
+        first_llama_vec = llama_vecs_cropped[0]
+        first_clip_l_pooler = clip_l_poolers[0]
+        first_llama_attention_mask = llama_attention_masks[0]
 
         for i, latent_padding in enumerate(latent_paddings):
             print(f"latent_padding: {latent_padding}")
@@ -534,6 +551,19 @@ class FramePackSampler:
             else:
                 transformer.initialize_teacache(enable_teacache=False)
 
+            if is_first_section:
+                llama_vec = llama_vecs_cropped.pop()
+                clip_l_pooler = clip_l_poolers.pop()
+                llama_attention_mask = llama_attention_masks.pop()
+            elif is_last_section or not llama_vecs_cropped:
+                llama_vec = first_llama_vec
+                clip_l_pooler = first_clip_l_pooler
+                llama_attention_mask = first_llama_attention_mask
+            else:
+                llama_vec = llama_vecs_cropped[1]
+                clip_l_pooler = clip_l_poolers[1]
+                llama_attention_mask = llama_attention_masks[1]
+
             with torch.autocast(device_type=mm.get_autocast_device(device), dtype=base_dtype, enabled=True):
                 generated_latents = sample_hunyuan(
                     transformer=transformer,
@@ -583,6 +613,24 @@ class FramePackSampler:
         mm.soft_empty_cache()
 
         return {"samples": real_history_latents / vae_scaling_factor},
+
+    def _encode_prompt_and_generate_attention_mask(llama_vecs, text_encoder, text_encoder_2, tokenizer, tokenizer_2):
+        prompts = prompt.split(';')
+        llama_vecs = []
+        clip_l_poolers = []
+        llama_attention_masks = []
+        for prompt in prompts:
+            llama_vec, clip_l_pooler = encode_prompt_conds(prompt, text_encoder, text_encoder_2, tokenizer, tokenizer_2)
+
+            llama_vec, llama_attention_mask = crop_or_pad_yield_mask(llama_vec, length=512)
+            llama_vec = llama_vec.to(transformer.dtype)
+            clip_l_pooler = clip_l_pooler.to(transformer.dtype)
+            llama_attention_masks.append(llama_attention_mask)
+            llama_vecs.append(llama_vec)
+            clip_l_poolers.append(clip_l_pooler)
+        return list(llama_vecs), list(clip_l_poolers), list(llama_attention_masks)
+
+
     
 NODE_CLASS_MAPPINGS = {
     "DownloadAndLoadFramePackModel": DownloadAndLoadFramePackModel,
